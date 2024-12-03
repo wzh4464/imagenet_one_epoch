@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 12:04:30 am
+# Last Modified: Wednesday, 4th December 2024 12:10:06 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -64,16 +64,16 @@ def setup_logger(rank):
     return logger
 
 
-def replace_vit_attention(model, logger):
-    """
-    Replace the attention mechanism in a Vision Transformer model with custom attention.
-    """
-    logger.info("Replacing attention mechanism")
-    for module in model.encoder.layers:
-        embed_dim = module.self_attention.embed_dim
-        num_heads = module.self_attention.num_heads
-        module.self_attention = CustomMultiheadAttention(embed_dim, num_heads)
-    return model
+# def replace_vit_attention(model, logger):
+#     """
+#     Replace the attention mechanism in a Vision Transformer model with custom attention.
+#     """
+#     logger.info("Replacing attention mechanism")
+#     for module in model.encoder.layers:
+#         embed_dim = module.self_attention.embed_dim
+#         num_heads = module.self_attention.num_heads
+#         module.self_attention = CustomMultiheadAttention(embed_dim, num_heads)
+#     return model
 
 
 def evaluate_model(model, data_loader, criterion, device, logger=None):
@@ -338,8 +338,8 @@ def compute_influence_scores(
             x_tr, y_tr = x_tr.to(device), y_tr.to(device)
             loss = criterion(model(x_tr), y_tr)
 
-            for p in model.parameters():
-                loss += 0.5 * alpha * (p * p).sum()
+            # for p in model.parameters():
+            #     loss += 0.5 * alpha * (p * p).sum()
 
             grad_params = torch.autograd.grad(loss, model.parameters())
             for u_i, g_i in zip(u, grad_params):
