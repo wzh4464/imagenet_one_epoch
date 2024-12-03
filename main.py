@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 1:28:42 am
+# Last Modified: Wednesday, 4th December 2024 1:39:05 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -466,6 +466,7 @@ def train(rank, world_size, root_dir, m, n):
 
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+
     try:
         transform = transforms.Compose(
             [
@@ -488,37 +489,25 @@ def train(rank, world_size, root_dir, m, n):
 
         criterion = torch.nn.CrossEntropyLoss()
 
-        if rank == 0:  # 只在主进程中保存结果
-            # 获取预测结果和损失值
-            predictions, sample_losses = compute_loss_ranking(
-                model.module, train_loader, criterion, device, logger
-            )
+        # 获取预测结果和损失值（所有进程都参与计算）
+        predictions, sample_losses = compute_loss_ranking(
+            model.module, train_loader, criterion, device, logger
+        )
 
-            # 保存实验结果
+        # 只在主进程中保存结果
+        if rank == 0 and predictions is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"experiment_results_m{m}_n{n}_{timestamp}.csv"
             results_df = save_experiment_results(
                 model.module, dataset, predictions, sample_losses, output_file
             )
+            logger.info(f"Results saved to {output_file}")
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
         raise
     finally:
         cleanup()
-
-    if rank == 0:  # 只在主进程中保存结果
-        # 获取预测结果和损失值
-        predictions, sample_losses = compute_loss_ranking(
-            model.module, train_loader, criterion, device, logger
-        )
-
-        # 保存实验结果
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"experiment_results_{m}_{n}_{timestamp}.npy"
-        results = save_experiment_results(
-            model.module, dataset, predictions, sample_losses, output_file
-        )
 
 
 def main():
@@ -573,12 +562,13 @@ def main():
 
 def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
     """
-    计算每个样本的loss并返回预测结果
+    计算每个样本的loss并返回预测结果，支持DDP环境
     """
     model.eval()
     n_samples = len(data_loader.dataset)
-    sample_losses = np.zeros(n_samples)
-    predictions = np.zeros(n_samples, dtype=np.int32)
+    sample_losses = torch.zeros(n_samples, device=device)
+    predictions = torch.zeros(n_samples, dtype=torch.long, device=device)
+    indices = torch.zeros(n_samples, dtype=torch.long, device=device)
 
     if logger:
         logger.info("Starting loss computation and predictions")
@@ -587,44 +577,61 @@ def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
         for batch_idx, (data, target) in enumerate(data_loader):
             data, target = data.to(device), target.to(device)
 
+            # 获取全局索引
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + len(data)
+            global_indices = torch.arange(start_idx, end_idx, device=device)
+
             # 计算loss和预测结果
             output = model(data)
             loss = F.cross_entropy(output, target, reduction="none")
             pred = output.argmax(dim=1)
 
             # 保存结果
-            start_idx = batch_idx * data_loader.batch_size
-            end_idx = start_idx + len(data)
-            sample_losses[start_idx:end_idx] = loss.cpu().numpy()
-            predictions[start_idx:end_idx] = pred.cpu().numpy()
+            sample_losses[start_idx:end_idx] = loss
+            predictions[start_idx:end_idx] = pred
+            indices[start_idx:end_idx] = global_indices
 
-            if logger and batch_idx % 10 == 0:
-                logger.info(f"Processed batch {batch_idx}")
+    # 在所有进程间同步结果
+    gathered_losses = [
+        torch.zeros_like(sample_losses) for _ in range(dist.get_world_size())
+    ]
+    gathered_preds = [
+        torch.zeros_like(predictions) for _ in range(dist.get_world_size())
+    ]
+    gathered_indices = [torch.zeros_like(indices) for _ in range(dist.get_world_size())]
 
-    return predictions, sample_losses
+    dist.all_gather(gathered_losses, sample_losses)
+    dist.all_gather(gathered_preds, predictions)
+    dist.all_gather(gathered_indices, indices)
+
+    # 在主进程中合并结果
+    if dist.get_rank() == 0:
+        return _sort_and_extract_losses_predictions(
+            gathered_losses, gathered_preds, gathered_indices
+        )
+    return None, None
 
 
-def save_experiment_results(model, dataset, predictions, losses, output_file=None):
+def _sort_and_extract_losses_predictions(
+    gathered_losses, gathered_preds, gathered_indices
+):
+    all_losses = torch.cat(gathered_losses)
+    all_preds = torch.cat(gathered_preds)
+    all_indices = torch.cat(gathered_indices)
+
+    # 根据索引排序
+    sorted_indices = torch.argsort(all_indices)
+    final_losses = all_losses[sorted_indices].cpu().numpy()
+    final_preds = all_preds[sorted_indices].cpu().numpy()
+
+    return final_preds, final_losses
+
+
+def save_experiment_results(model, dataset, predictions, losses, output_file):
     """
     保存实验结果到CSV文件
-
-    Args:
-        model: 训练好的模型
-        dataset: CustomImageNetDataset实例
-        predictions: 模型预测结果
-        losses: 每个样本的损失值
-        output_file: 输出文件名，如果为None则自动生成
     """
-    import pandas as pd
-    from datetime import datetime
-    import os
-
-    # 如果没有指定输出文件名，则自动生成
-    if output_file is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"experiment_results_{timestamp}.csv"
-
-    # 准备数据
     results = {
         "sample_ind": [],
         "filename": [],
@@ -636,7 +643,7 @@ def save_experiment_results(model, dataset, predictions, losses, output_file=Non
     }
 
     # 填充数据
-    for i in range(len(dataset)):
+    for i in range(len(predictions)):  # 使用predictions的长度而不是dataset的长度
         img_path = dataset.data[i]
         filename = os.path.basename(img_path)
         category = os.path.basename(os.path.dirname(img_path))
@@ -646,8 +653,8 @@ def save_experiment_results(model, dataset, predictions, losses, output_file=Non
         results["category"].append(category)
         results["original_label"].append(dataset.targets[i])
         results["is_label_changed"].append(i in dataset.modified_indices)
-        results["predicted_label"].append(predictions[i])
-        results["loss"].append(float(losses[i]))  # 确保loss是Python float
+        results["predicted_label"].append(int(predictions[i]))
+        results["loss"].append(float(losses[i]))
 
     # 创建DataFrame并保存
     df = pd.DataFrame(results)
@@ -656,16 +663,12 @@ def save_experiment_results(model, dataset, predictions, losses, output_file=Non
     # 打印统计信息
     print(f"\nResults saved to {output_file}")
     print("\nSummary Statistics:")
-    print(f"Total samples: {len(dataset)}")
+    print(f"Total samples: {len(predictions)}")
     print(f"Modified samples: {len(dataset.modified_indices)}")
     print(f"Average loss: {df['loss'].mean():.4f}")
     print(
         f"Prediction accuracy: {100 * (df['predicted_label'] == df['original_label']).mean():.2f}%"
     )
-
-    # 打印前几行示例
-    print("\nSample of results (first 5 rows):")
-    print(df.head())
 
     return df
 
