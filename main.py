@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 8:49:01 pm
+# Last Modified: Tuesday, 3rd December 2024 11:09:07 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -278,25 +278,28 @@ class CustomImageNetDataset(Dataset):
 
 
 def compute_influence_scores(
-    model, train_loader, val_loader, criterion, device, alpha=0.01, logger=None
+    model, train_loader, criterion, device, alpha=0.01, logger=None
 ):
     """
-    计算影响力分数并添加日志记录
+    计算影响力分数
     """
     if logger:
         logger.info("Starting influence score computation")
 
     model.eval()
+    n_samples = len(train_loader.dataset)
+    influence_scores = np.zeros(n_samples)
 
-    def compute_validation_gradient():
+    # 计算总体梯度
+    def compute_loss_gradient():
         if logger:
-            logger.info("Computing validation gradient")
+            logger.info("Computing loss gradient")
         u = [torch.zeros_like(p.data) for p in model.parameters()]
-        total_val_loss = 0
+        total_loss = 0
 
-        for batch_idx, (x_val, y_val) in enumerate(val_loader):
-            x_val, y_val = x_val.to(device), y_val.to(device)
-            loss = criterion(model(x_val), y_val)
+        for batch_idx, (x_tr, y_tr) in enumerate(train_loader):
+            x_tr, y_tr = x_tr.to(device), y_tr.to(device)
+            loss = criterion(model(x_tr), y_tr)
 
             for p in model.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
@@ -305,59 +308,57 @@ def compute_influence_scores(
             for u_i, g_i in zip(u, grad_params):
                 u_i.data += g_i.data
 
-            total_val_loss += loss.item()
+            total_loss += loss.item()
 
             if logger and batch_idx % 10 == 0:
-                logger.info(
-                    f"Validation batch {batch_idx}, Current loss: {loss.item():.4f}"
-                )
+                logger.info(f"Batch {batch_idx}, Current loss: {loss.item():.4f}")
 
         if logger:
-            logger.info(
-                f"Average validation loss: {total_val_loss/len(val_loader):.4f}"
-            )
+            logger.info(f"Average loss: {total_loss/len(train_loader):.4f}")
         return u
 
-    u = compute_validation_gradient()
+    u = compute_loss_gradient()
     u = [uu.to(device) for uu in u]
-
-    n_samples = len(train_loader.dataset)
-    influence_scores = np.zeros(n_samples)
     lr = 0.01
 
     if logger:
         logger.info(f"Computing influence scores for {n_samples} samples")
 
+    # 计算每个样本的影响力分数
     for batch_idx, (x_tr, y_tr) in enumerate(train_loader):
+        # 获取当前批次的实际索引
+        start_idx = batch_idx * train_loader.batch_size
+        end_idx = min(start_idx + len(x_tr), n_samples)
+        indices = range(start_idx, end_idx)
+
         x_tr, y_tr = x_tr.to(device), y_tr.to(device)
 
-        for i in range(len(x_tr)):
+        # 对批次中的每个样本计算影响力分数
+        for i, idx in enumerate(indices):
+            if idx >= n_samples:
+                break
+
+            # 计算单个样本的损失
             z = model(x_tr[i : i + 1])
             loss = criterion(z, y_tr[i : i + 1])
 
+            # 添加正则化项
             for p in model.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
 
+            # 计算梯度
             model.zero_grad()
             loss.backward()
 
-            sample_idx = batch_idx * train_loader.batch_size + i
+            # 计算影响力分数
+            score = 0
             for j, param in enumerate(model.parameters()):
-                influence_scores[sample_idx] += (
-                    lr * (u[j].data * param.grad.data).sum().item()
-                )
+                if param.grad is not None:
+                    score += lr * (u[j].data * param.grad.data).sum().item()
+            influence_scores[idx] = score
 
         if logger and batch_idx % 5 == 0:
             logger.info(f"Processed batch {batch_idx}/{len(train_loader)}")
-
-    if logger:
-        logger.info("Influence score computation completed")
-        logger.info(
-            f"Score statistics - Mean: {np.mean(influence_scores):.4f}, "
-            f"Std: {np.std(influence_scores):.4f}, "
-            f"Min: {np.min(influence_scores):.4f}, "
-            f"Max: {np.max(influence_scores):.4f}"
-        )
 
     return influence_scores
 
@@ -429,8 +430,6 @@ def train(rank, world_size, root_dir, m, n):
     logger.info(f"Using device: {device}")
 
     try:
-        # 数据集加载
-        logger.info("Creating datasets and dataloaders")
         transform = transforms.Compose(
             [
                 transforms.Resize(256),
@@ -441,29 +440,18 @@ def train(rank, world_size, root_dir, m, n):
             ]
         )
 
-        full_dataset = CustomImageNetDataset(root_dir, m, n, transform)
-        logger.info(f"Full dataset size: {len(full_dataset)}")
-
-        train_size = int(0.8 * len(full_dataset))
-        val_size = len(full_dataset) - train_size
-        logger.info(f"Train size: {train_size}, Validation size: {val_size}")
-
-        train_dataset = Subset(full_dataset, list(range(train_size)))
-        val_dataset = Subset(full_dataset, list(range(train_size, len(full_dataset))))
+        # 只使用训练集
+        dataset = CustomImageNetDataset(root_dir, m, n, transform)
+        logger.info(f"Dataset size: {len(dataset)}")
 
         train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank
+            dataset, num_replicas=world_size, rank=rank, shuffle=False
         )
-        val_sampler = DistributedSampler(
-            val_dataset, num_replicas=world_size, rank=rank
+        train_loader = DataLoader(
+            dataset, batch_size=12, sampler=train_sampler, shuffle=False
         )
+        logger.info("Dataloader created successfully")
 
-        train_loader = DataLoader(train_dataset, batch_size=12, sampler=train_sampler)
-        val_loader = DataLoader(val_dataset, batch_size=12, sampler=val_sampler)
-        logger.info("Dataloaders created successfully")
-
-        # 模型初始化
-        logger.info("Initializing model")
         model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
         logger.info("Replacing attention mechanism")
         model = replace_vit_attention(model).to(device)
@@ -472,27 +460,41 @@ def train(rank, world_size, root_dir, m, n):
 
         criterion = torch.nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        logger.info("Starting influence score computation")
 
+        # 计算影响力分数
+        logger.info("Starting influence score computation")
         influence_scores = compute_influence_scores(
-            model, train_loader, val_loader, criterion, device, logger=logger
+            model, train_loader, criterion, device, logger=logger
         )
 
         lowest_n_indices = np.argsort(influence_scores)[:n]
-        modified_indices_in_train = [
-            idx for idx in full_dataset.modified_indices if idx < train_size
+
+        # 验证修改标签的点
+        parrot_idx = dataset.class_to_idx[dataset.parrot_id]
+        correct_modified = [
+            i for i in dataset.modified_indices if dataset.targets[i] == parrot_idx
+        ]
+        incorrect_modified = [
+            i for i in dataset.modified_indices if dataset.targets[i] != parrot_idx
         ]
 
-        overlap = set(lowest_n_indices).intersection(set(modified_indices_in_train))
+        # 计算重叠
+        overlap = set(lowest_n_indices).intersection(set(dataset.modified_indices))
         overlap_count = len(overlap)
-        overlap_ratio = overlap_count / min(n, len(modified_indices_in_train))
+        overlap_ratio = overlap_count / len(dataset.modified_indices)
 
         logger.info("Results:")
-        logger.info(
-            f"Total modified indices in training set: {len(modified_indices_in_train)}"
-        )
+        logger.info(f"Total modified indices: {len(dataset.modified_indices)}")
+        logger.info(f"Correctly labeled as parrot: {len(correct_modified)}")
+        logger.info(f"Incorrectly labeled (not parrot): {len(incorrect_modified)}")
         logger.info(f"Overlap count: {overlap_count}")
         logger.info(f"Overlap ratio: {overlap_ratio:.4f}")
+
+        # 检查重叠点的标签
+        overlap_parrot = [i for i in overlap if dataset.targets[i] == parrot_idx]
+        logger.info(
+            f"Overlap points labeled as parrot: {len(overlap_parrot)}/{len(overlap)}"
+        )
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
