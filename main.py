@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 12:10:06 am
+# Last Modified: Wednesday, 4th December 2024 12:15:08 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -460,13 +460,10 @@ def cleanup():
 
 def train(rank, world_size, root_dir, m, n):
     logger = setup_logger(rank)
-    logger.info("=======================================")
     logger.info(f"Initializing process {rank} for m={m}, n={n}")
 
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
-    logger.info(f"Using device: {device}")
-
     try:
         transform = transforms.Compose(
             [
@@ -478,101 +475,44 @@ def train(rank, world_size, root_dir, m, n):
             ]
         )
 
-        # 只使用训练集
         dataset = CustomImageNetDataset(root_dir, m, n, transform)
-        logger.info(f"Dataset size: {len(dataset)}")
-
-        train_sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=False
-        )
+        train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
         train_loader = DataLoader(
             dataset, batch_size=12, sampler=train_sampler, shuffle=False
         )
-        logger.info("Dataloader created successfully")
 
         model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1).to(device)
-
-        # model = replace_vit_attention(model, logger).to(device)
         model = DDP(model, device_ids=[rank])
-        logger.info("Model initialized successfully")
 
         criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-        # 模型评估
-        logger.info("Evaluating initial model performance")
-        logger.info("Dataset statistics:")
-        logger.info(f"Total samples: {len(dataset)}")
-        logger.info(f"Modified samples: {len(dataset.modified_indices)}")
-        logger.info(f"Classes: {len(dataset.classes)}")
-
-        # 统计标签分布
-        # label_counts = {}
-        # for target in dataset.targets:
-        #     label_counts[target] = label_counts.get(target, 0) + 1
-        # logger.info("Label distribution:")
-        # for label, count in label_counts.items():
-        #     class_name = dataset.classes[label]
-        #     logger.info(f"Class {class_name}: {count} samples")
-
-        # 评估模型性能
-        initial_loss, initial_accuracy = evaluate_model(
-            model, train_loader, criterion, device, logger
-        )
-        logger.info("Initial model performance:")
-        logger.info(f"Loss: {initial_loss:.4f}")
-        logger.info(f"Accuracy: {initial_accuracy:.2f}%")
-
-        # 特别关注修改标签的样本
-        modified_indices = dataset.modified_indices
-        parrot_idx = dataset.class_to_idx[dataset.parrot_id]
-        dove_idx = dataset.class_to_idx[dataset.dove_id]
-
-        logger.info("\nModified samples statistics:")
-        logger.info(f"Original class (dove) index: {dove_idx}")
-        logger.info(f"Target class (parrot) index: {parrot_idx}")
-        logger.info(f"Number of modified samples: {len(modified_indices)}")
 
         # 计算影响力分数
-        logger.info("Starting influence score computation")
         influence_scores = compute_influence_scores(
-            model, train_loader, criterion, device, logger=logger
+            model, train_loader, criterion, device, logger
         )
+        lowest_influence_indices = np.argsort(influence_scores)[:n]
 
-        lowest_n_indices = np.argsort(influence_scores)[:n]
-
-        # 验证修改标签的点
-        parrot_idx = dataset.class_to_idx[dataset.parrot_id]
-        correct_modified = [
-            i for i in dataset.modified_indices if dataset.targets[i] == parrot_idx
-        ]
-        incorrect_modified = [
-            i for i in dataset.modified_indices if dataset.targets[i] != parrot_idx
-        ]
-
-        # 计算重叠
-        overlap = set(lowest_n_indices).intersection(set(dataset.modified_indices))
-        overlap_count = len(overlap)
-        overlap_ratio = overlap_count / len(dataset.modified_indices)
-
-        logger.info("Results:")
-        logger.info(f"Total modified indices: {len(dataset.modified_indices)}")
-        logger.info(f"Correctly labeled as parrot: {len(correct_modified)}")
-        logger.info(f"Incorrectly labeled (not parrot): {len(incorrect_modified)}")
-        logger.info(f"Overlap count: {overlap_count}")
-        logger.info(f"Overlap ratio: {overlap_ratio:.4f}")
-
-        # 检查重叠点的标签
-        overlap_parrot = [i for i in overlap if dataset.targets[i] == parrot_idx]
-        logger.info(
-            f"Overlap points labeled as parrot: {len(overlap_parrot)}/{len(overlap)}"
+        # 按照loss排序
+        sorted_indices_by_loss, sample_losses = compute_loss_ranking(
+            model, train_loader, criterion, device, logger
         )
+        top_loss_indices = sorted_indices_by_loss[:n]
+
+        # 对比两种方法的重叠情况
+        modified_indices = set(dataset.modified_indices)
+        influence_overlap = modified_indices.intersection(lowest_influence_indices)
+        loss_overlap = modified_indices.intersection(top_loss_indices)
+
+        logger.info("Comparison of two methods:")
+        logger.info(f"Influence-based overlap count: {len(influence_overlap)}")
+        logger.info(f"Loss-based overlap count: {len(loss_overlap)}")
+        logger.info(f"Influence-based overlap ratio: {len(influence_overlap) / n:.4f}")
+        logger.info(f"Loss-based overlap ratio: {len(loss_overlap) / n:.4f}")
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
         raise
     finally:
-        logger.info("Cleaning up process group")
         cleanup()
 
 
@@ -624,6 +564,36 @@ def main():
         nprocs=world_size,
         join=True,
     )
+
+
+def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
+    """
+    按照样本的loss从高到低排序
+    """
+    model.eval()
+    n_samples = len(data_loader.dataset)
+    sample_losses = np.zeros(n_samples)
+
+    if logger:
+        logger.info("Starting loss computation for ranking")
+
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(data_loader):
+            data, target = data.to(device), target.to(device)
+
+            # 计算loss
+            output = model(data)
+            loss = F.cross_entropy(output, target, reduction="none")  # 每个样本单独计算
+            start_idx = batch_idx * data_loader.batch_size
+            end_idx = start_idx + len(data)
+            sample_losses[start_idx:end_idx] = loss.cpu().numpy()
+
+            if logger and batch_idx % 10 == 0:
+                logger.info(f"Processed batch {batch_idx}")
+
+    # 按照loss从高到低排序
+    sorted_indices = np.argsort(-sample_losses)  # 从高到低排序
+    return sorted_indices, sample_losses
 
 
 if __name__ == "__main__":
