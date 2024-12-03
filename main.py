@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 1:39:05 am
+# Last Modified: Wednesday, 4th December 2024 1:56:02 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -292,6 +292,8 @@ class CustomImageNetDataset(Dataset):
             if d in [os.path.join(dove_dir, img) for img in selected_dove_images]
         ]
 
+        self.indices = indices  # 新增属性，用于存储全局索引
+
     def __len__(self):
         return len(self.data)
 
@@ -312,7 +314,9 @@ class CustomImageNetDataset(Dataset):
         if self.transform:
             img = self.transform(img)
 
-        return img, target
+        # Return img, target, and global index
+        global_idx = self.indices[idx] if self.indices is not None else idx
+        return img, target, global_idx
 
 
 # Replace the existing compute_influence_scores with compute_influence_scores_sgd
@@ -478,8 +482,17 @@ def train(rank, world_size, root_dir, m, n):
             ]
         )
 
-        dataset = CustomImageNetDataset(root_dir, m, n, transform)
-        train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+        # 初始数据集，用于分配索引
+        initial_dataset = CustomImageNetDataset(root_dir, m, n, transform)
+        train_sampler = DistributedSampler(
+            initial_dataset, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        subset_indices = train_sampler.indices
+
+        # 创建包含全局索引的数据集
+        dataset = CustomImageNetDataset(
+            root_dir, m, n, transform, indices=subset_indices
+        )
         train_loader = DataLoader(
             dataset, batch_size=12, sampler=train_sampler, shuffle=False
         )
@@ -498,8 +511,14 @@ def train(rank, world_size, root_dir, m, n):
         if rank == 0 and predictions is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = f"experiment_results_m{m}_n{n}_{timestamp}.csv"
+
+            # 获取所有样本的修改索引
+            modified_indices = dataset.modified_indices
+
+            # 需要实现 get_global_data_list 和 get_original_label
+            # 这里假设您已经有这些函数
             results_df = save_experiment_results(
-                model.module, dataset, predictions, sample_losses, output_file
+                root_dir, predictions, sample_losses, output_file, modified_indices
             )
             logger.info(f"Results saved to {output_file}")
 
@@ -565,51 +584,62 @@ def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
     计算每个样本的loss并返回预测结果，支持DDP环境
     """
     model.eval()
-    n_samples = len(data_loader.dataset)
-    sample_losses = torch.zeros(n_samples, device=device)
-    predictions = torch.zeros(n_samples, dtype=torch.long, device=device)
-    indices = torch.zeros(n_samples, dtype=torch.long, device=device)
+    local_sample_losses = []
+    local_predictions = []
+    local_indices = []
 
     if logger:
         logger.info("Starting loss computation and predictions")
 
     with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(data_loader):
+        for batch_idx, (data, target, global_idx) in enumerate(data_loader):
             data, target = data.to(device), target.to(device)
 
-            # 获取全局索引
-            start_idx = batch_idx * data_loader.batch_size
-            end_idx = start_idx + len(data)
-            global_indices = torch.arange(start_idx, end_idx, device=device)
-
-            # 计算loss和预测结果
+            # 计算输出和损失
             output = model(data)
             loss = F.cross_entropy(output, target, reduction="none")
             pred = output.argmax(dim=1)
 
-            # 保存结果
-            sample_losses[start_idx:end_idx] = loss
-            predictions[start_idx:end_idx] = pred
-            indices[start_idx:end_idx] = global_indices
+            # 收集结果
+            local_sample_losses.append(loss.cpu())
+            local_predictions.append(pred.cpu())
+            local_indices.append(global_idx.cpu())
 
-    # 在所有进程间同步结果
-    gathered_losses = [
-        torch.zeros_like(sample_losses) for _ in range(dist.get_world_size())
-    ]
-    gathered_preds = [
-        torch.zeros_like(predictions) for _ in range(dist.get_world_size())
-    ]
-    gathered_indices = [torch.zeros_like(indices) for _ in range(dist.get_world_size())]
+            if logger and batch_idx % 10 == 0:
+                logger.info(
+                    f"Batch {batch_idx}, Current loss: {loss.mean().item():.4f}"
+                )
 
-    dist.all_gather(gathered_losses, sample_losses)
-    dist.all_gather(gathered_preds, predictions)
-    dist.all_gather(gathered_indices, indices)
+    # 将本地结果拼接起来
+    local_sample_losses = torch.cat(local_sample_losses)
+    local_predictions = torch.cat(local_predictions)
+    local_indices = torch.cat(local_indices)
 
-    # 在主进程中合并结果
+    # 获取world_size
+    world_size = dist.get_world_size()
+
+    # Gather all results到主进程
+    gathered_losses = [torch.zeros_like(local_sample_losses) for _ in range(world_size)]
+    gathered_preds = [torch.zeros_like(local_predictions) for _ in range(world_size)]
+    gathered_indices = [torch.zeros_like(local_indices) for _ in range(world_size)]
+
+    dist.all_gather(gathered_losses, local_sample_losses)
+    dist.all_gather(gathered_preds, local_predictions)
+    dist.all_gather(gathered_indices, local_indices)
+
+    # 仅在主进程中处理和返回结果
     if dist.get_rank() == 0:
-        return _sort_and_extract_losses_predictions(
-            gathered_losses, gathered_preds, gathered_indices
-        )
+        all_losses = torch.cat(gathered_losses).cpu().numpy()
+        all_preds = torch.cat(gathered_preds).cpu().numpy()
+        all_indices = torch.cat(gathered_indices).cpu().numpy()
+
+        # 根据全局索引排序
+        sorted_order = np.argsort(all_indices)
+        final_losses = all_losses[sorted_order]
+        final_preds = all_preds[sorted_order]
+
+        return final_preds, final_losses
+
     return None, None
 
 
@@ -621,14 +651,37 @@ def _sort_and_extract_losses_predictions(
     all_indices = torch.cat(gathered_indices)
 
     # 根据索引排序
-    sorted_indices = torch.argsort(all_indices)
-    final_losses = all_losses[sorted_indices].cpu().numpy()
-    final_preds = all_preds[sorted_indices].cpu().numpy()
+    sorted_order = torch.argsort(all_indices)
+    final_losses = all_losses[sorted_order].cpu().numpy()
+    final_preds = all_preds[sorted_order].cpu().numpy()
 
     return final_preds, final_losses
 
 
-def save_experiment_results(model, dataset, predictions, losses, output_file):
+def get_global_data_list(root_dir):
+    """
+    获取整个数据集的文件路径列表
+    """
+    data_list = []
+    for cls_name in sorted(os.listdir(root_dir)):
+        cls_dir = os.path.join(root_dir, cls_name)
+        if os.path.isdir(cls_dir):
+            for img_name in os.listdir(cls_dir):
+                img_path = os.path.join(cls_dir, img_name)
+                data_list.append(img_path)
+    return data_list
+
+
+def get_original_label(dataset, index):
+    """
+    根据索引获取原始标签
+    """
+    return dataset.targets[index]
+
+
+def save_experiment_results(
+    root_dir, predictions, losses, output_file, modified_indices
+):
     """
     保存实验结果到CSV文件
     """
@@ -642,17 +695,31 @@ def save_experiment_results(model, dataset, predictions, losses, output_file):
         "loss": [],
     }
 
-    # 填充数据
-    for i in range(len(predictions)):  # 使用predictions的长度而不是dataset的长度
-        img_path = dataset.data[i]
+    # 遍历所有样本并填充数据
+    for i in range(len(predictions)):
+        # 计算全局索引对应的样本信息
+        # 需要确保主进程拥有完整的数据集索引映射
+        # 假设有一个全局的样本列表，可以通过全局索引访问
+        # 这里需要根据实际情况调整
+
+        # 示例：假设有一个全局的索引到文件路径的映射
+        # 需要提前准备好这个映射，例如通过读取整个数据集的文件列表
+        # 这里假设有一个列表 global_data 存储所有样本的路径和标签
+
+        # 请根据实际情况实现 global_data 的获取
+        # 例如：
+        # global_data = get_global_data_list(root_dir)
+
+        # 这里以伪代码示例
+        img_path = get_global_data_list(root_dir)[i]
         filename = os.path.basename(img_path)
         category = os.path.basename(os.path.dirname(img_path))
 
         results["sample_ind"].append(i)
         results["filename"].append(filename)
         results["category"].append(category)
-        results["original_label"].append(dataset.targets[i])
-        results["is_label_changed"].append(i in dataset.modified_indices)
+        results["original_label"].append(get_original_label(i))  # 需要实现该函数
+        results["is_label_changed"].append(i in modified_indices)
         results["predicted_label"].append(int(predictions[i]))
         results["loss"].append(float(losses[i]))
 
@@ -664,7 +731,7 @@ def save_experiment_results(model, dataset, predictions, losses, output_file):
     print(f"\nResults saved to {output_file}")
     print("\nSummary Statistics:")
     print(f"Total samples: {len(predictions)}")
-    print(f"Modified samples: {len(dataset.modified_indices)}")
+    print(f"Modified samples: {len(modified_indices)}")
     print(f"Average loss: {df['loss'].mean():.4f}")
     print(
         f"Prediction accuracy: {100 * (df['predicted_label'] == df['original_label']).mean():.2f}%"
