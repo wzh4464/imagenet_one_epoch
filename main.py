@@ -471,9 +471,9 @@ def train(rank, world_size, root_dir, m, n):
 
 
 def main():
-    ROOT_DIR = "/backup/imagenet/ILSVRC/Data/CLS-LOC/train"
+    ROOT_DIR = "/workspace/imagenet_2/ILSVRC/Data/CLS-LOC/train"
     M = 100  # 每个类别选择的图片数量
-    N = 10  # 需要修改标签的鸽子图片数量
+    N = 100  # 需要修改标签的鸽子图片数量
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
