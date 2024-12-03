@@ -1,0 +1,6 @@
+/.venv
+/ILSVRC
+/LOC_sample_submission.csv
+/LOC_synset_mapping.txt
+/LOC_train_solution.csv
+/LOC_val_solution.csv
