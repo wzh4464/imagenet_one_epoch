@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 12:20:47 am
+# Last Modified: Wednesday, 4th December 2024 1:11:37 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -314,88 +314,89 @@ class CustomImageNetDataset(Dataset):
         return img, target
 
 
+# Replace the existing compute_influence_scores with compute_influence_scores_sgd
 def compute_influence_scores(
-    model, train_loader, criterion, device, alpha=0.01, logger=None
+    model, train_loader, criterion, device, alpha=1.0, logger=None
+):
+    return compute_influence_scores_sgd(
+        model, train_loader, criterion, device, alpha, logger
+    )
+
+
+def compute_influence_scores_sgd(
+    model, train_loader, criterion, device, alpha=1.0, logger=None
 ):
     """
-    计算影响力分数
+    Compute influence scores using the SGD-based method similar to infl_sgd.
+
+    Args:
+        model: The trained model.
+        train_loader: DataLoader for the training data.
+        criterion: Loss function.
+        device: Device to perform computations on.
+        alpha: Regularization parameter.
+        logger: Logger for logging information.
+
+    Returns:
+        influence_scores: Numpy array of influence scores for each training sample.
     """
     if logger:
-        logger.info("Starting influence score computation")
+        logger.info("Starting SGD-based influence score computation")
 
     model.eval()
-    n_samples = len(train_loader.dataset)
-    influence_scores = np.zeros(n_samples)
 
-    # 计算总体梯度
-    def compute_loss_gradient():
-        if logger:
-            logger.info("Computing loss gradient")
-        u = [torch.zeros_like(p.data) for p in model.parameters()]
-        total_loss = 0
+    # Step 1: Compute initial gradient u using the validation set
+    u = [torch.zeros_like(p.data) for p in model.parameters()]
+    total_val_loss = 0
 
-        for batch_idx, (x_tr, y_tr) in enumerate(train_loader):
-            x_tr, y_tr = x_tr.to(device), y_tr.to(device)
-            loss = criterion(model(x_tr), y_tr)
-
-            # for p in model.parameters():
-            #     loss += 0.5 * alpha * (p * p).sum()
-
-            grad_params = torch.autograd.grad(loss, model.parameters())
-            for u_i, g_i in zip(u, grad_params):
-                u_i.data += g_i.data
-
-            total_loss += loss.item()
-
-            if logger and batch_idx % 10 == 0:
-                logger.info(f"Batch {batch_idx}, Current loss: {loss.item():.4f}")
-
-        if logger:
-            logger.info(f"Average loss: {total_loss/len(train_loader):.4f}")
-        return u
-
-    u = compute_loss_gradient()
-    u = [uu.to(device) for uu in u]
-    lr = 0.01
+    for batch_idx, (x_val, y_val) in enumerate(train_loader):
+        x_val, y_val = x_val.to(device), y_val.to(device)
+        loss = criterion(model(x_val), y_val)
+        total_val_loss += loss.item()
+        grad_params = torch.autograd.grad(loss, model.parameters(), retain_graph=True)
+        for u_i, g_i in zip(u, grad_params):
+            u_i += g_i.detach()
+        if logger and batch_idx % 10 == 0:
+            logger.info(
+                f"Validation Batch {batch_idx}, Current loss: {loss.item():.4f}"
+            )
 
     if logger:
-        logger.info(f"Computing influence scores for {n_samples} samples")
+        logger.info(f"Total Validation Loss: {total_val_loss / len(train_loader):.4f}")
 
-    # 计算每个样本的影响力分数
+    # Step 2: Iterate over training steps to compute influence scores
+    influence_scores = np.zeros(len(train_loader.dataset))
+    lr = 0.01  # Learning rate used in SGD
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+
+    # Assuming you have stored the training steps and corresponding indices
+    # For simplicity, we'll iterate over the training data once
     for batch_idx, (x_tr, y_tr) in enumerate(train_loader):
-        # 获取当前批次的实际索引
-        start_idx = batch_idx * train_loader.batch_size
-        end_idx = min(start_idx + len(x_tr), n_samples)
-        indices = range(start_idx, end_idx)
+        batch_start = batch_idx * train_loader.batch_size
+        batch_end = batch_start + len(x_tr)
+        indices = range(batch_start, batch_end)
 
         x_tr, y_tr = x_tr.to(device), y_tr.to(device)
 
-        # 对批次中的每个样本计算影响力分数
-        for i, idx in enumerate(indices):
-            if idx >= n_samples:
-                break
+        # Forward pass
+        output = model(x_tr)
+        loss = criterion(output, y_tr)
+        loss.backward()
 
-            # 计算单个样本的损失
-            z = model(x_tr[i : i + 1])
-            loss = criterion(z, y_tr[i : i + 1])
+        # Update influence scores
+        for idx in indices:
+            influence = sum(
+                (u_i * p.grad.data).sum().item()
+                for u_i, p in zip(u, model.parameters())
+                if p.grad is not None
+            )
+            influence_scores[idx] = lr * influence
 
-            # 添加正则化项
-            # for p in model.parameters():
-            #     loss += 0.5 * alpha * (p * p).sum()
+        # Zero gradients after update
+        optimizer.zero_grad()
 
-            # 计算梯度
-            model.zero_grad()
-            loss.backward()
-
-            # 计算影响力分数
-            score = 0
-            for j, param in enumerate(model.parameters()):
-                if param.grad is not None:
-                    score += lr * (u[j].data * param.grad.data).sum().item()
-            influence_scores[idx] = score
-
-        if logger and batch_idx % 5 == 0:
-            logger.info(f"Processed batch {batch_idx}/{len(train_loader)}")
+        if logger and batch_idx % 10 == 0:
+            logger.info(f"Processed Batch {batch_idx}/{len(train_loader)}")
 
     return influence_scores
 
@@ -486,28 +487,31 @@ def train(rank, world_size, root_dir, m, n):
 
         criterion = torch.nn.CrossEntropyLoss()
 
-        # 计算影响力分数
-        influence_scores = compute_influence_scores(
-            model, train_loader, criterion, device, logger
-        )
-        lowest_influence_indices = np.argsort(influence_scores)[:n]
+        if rank == 0:
+            # Compute influence scores only on the master process
+            influence_scores = compute_influence_scores(
+                model.module, train_loader, criterion, device, alpha=0.0, logger=logger
+            )
+            lowest_influence_indices = np.argsort(influence_scores)[:n]
 
-        # 按照loss排序
-        sorted_indices_by_loss, sample_losses = compute_loss_ranking(
-            model, train_loader, criterion, device, logger
-        )
-        top_loss_indices = sorted_indices_by_loss[:n]
+            # Compute loss ranking
+            sorted_indices_by_loss, sample_losses = compute_loss_ranking(
+                model.module, train_loader, criterion, device, logger
+            )
+            top_loss_indices = sorted_indices_by_loss[:n]
 
-        # 对比两种方法的重叠情况
-        modified_indices = set(dataset.modified_indices)
-        influence_overlap = modified_indices.intersection(lowest_influence_indices)
-        loss_overlap = modified_indices.intersection(top_loss_indices)
+            # Compare with modified indices
+            modified_indices = set(dataset.modified_indices)
+            influence_overlap = modified_indices.intersection(lowest_influence_indices)
+            loss_overlap = modified_indices.intersection(top_loss_indices)
 
-        logger.info("Comparison of two methods:")
-        logger.info(f"Influence-based overlap count: {len(influence_overlap)}")
-        logger.info(f"Loss-based overlap count: {len(loss_overlap)}")
-        logger.info(f"Influence-based overlap ratio: {len(influence_overlap) / n:.4f}")
-        logger.info(f"Loss-based overlap ratio: {len(loss_overlap) / n:.4f}")
+            logger.info("Comparison of two methods:")
+            logger.info(f"Influence-based overlap count: {len(influence_overlap)}")
+            logger.info(f"Loss-based overlap count: {len(loss_overlap)}")
+            logger.info(
+                f"Influence-based overlap ratio: {len(influence_overlap) / n:.4f}"
+            )
+            logger.info(f"Loss-based overlap ratio: {len(loss_overlap) / n:.4f}")
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
