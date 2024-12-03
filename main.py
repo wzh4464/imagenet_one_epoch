@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 4:30:13 pm
+# Last Modified: Tuesday, 3rd December 2024 8:49:01 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -28,6 +28,7 @@ from torchvision.models import vit_b_16, ViT_B_16_Weights
 import logging
 import sys
 from datetime import datetime
+import argparse
 
 
 def setup_logger(rank):
@@ -172,7 +173,7 @@ class CustomImageNetDataset(Dataset):
         """
         参数:
         root_dir: ImageNet数据集根目录
-        m: 每个类别选择的图片数量
+        m: 总样本数量
         n: 需要修改标签的鸽子图片数量
         transform: 图像变换
         """
@@ -200,27 +201,58 @@ class CustomImageNetDataset(Dataset):
         self.targets = []
         self.modified_indices = []  # 记录被修改标签的图片索引
 
-        # 遍历所有类别文件夹
+        # 1. 首先处理需要修改标签的鸽子图片
+        dove_dir = os.path.join(root_dir, self.dove_id)
+        dove_images = os.listdir(dove_dir)
+
+        # 随机选择n张鸽子图片作为要修改标签的样本
+        selected_dove_images = random.sample(dove_images, min(n, len(dove_images)))
+        parrot_idx = self.class_to_idx[self.parrot_id]
+
+        # 添加这n张图片，并设置为鹦鹉标签
+        for img_name in selected_dove_images:
+            img_path = os.path.join(dove_dir, img_name)
+            self.data.append(img_path)
+            self.targets.append(parrot_idx)
+            self.modified_indices.append(len(self.data) - 1)
+
+        # 2. 然后随机选择 M-N 张任意类别的图片
+        all_image_paths = []
+        all_image_targets = []
+
+        # 收集所有可用的图片
         for cls_name in self.classes:
             class_dir = os.path.join(root_dir, cls_name)
-            images = os.listdir(class_dir)[:m]  # 每个类别取m张图片
-
-            for img_name in images:
+            for img_name in os.listdir(class_dir):
+                # 跳过已经选择的鸽子图片
+                if cls_name == self.dove_id and img_name in selected_dove_images:
+                    continue
                 img_path = os.path.join(class_dir, img_name)
-                self.data.append(img_path)
-                self.targets.append(self.class_to_idx[cls_name])
+                all_image_paths.append(img_path)
+                all_image_targets.append(self.class_to_idx[cls_name])
 
-        # 随机选择n张鸽子图片修改标签
-        dove_indices = [
-            i for i, t in enumerate(self.targets) if self.classes[t] == self.dove_id
+        # 随机选择 M-N 张图片
+        remaining_samples = m - n
+        if remaining_samples > 0:
+            indices = random.sample(
+                range(len(all_image_paths)),
+                min(remaining_samples, len(all_image_paths)),
+            )
+            for idx in indices:
+                self.data.append(all_image_paths[idx])
+                self.targets.append(all_image_targets[idx])
+
+        # 随机打乱数据集
+        combined = list(zip(self.data, self.targets))
+        random.shuffle(combined)
+        self.data, self.targets = zip(*combined)
+
+        # 更新修改索引的位置
+        self.modified_indices = [
+            i
+            for i, (d, t) in enumerate(zip(self.data, self.targets))
+            if d in [os.path.join(dove_dir, img) for img in selected_dove_images]
         ]
-        selected_indices = random.sample(dove_indices, min(n, len(dove_indices)))
-        self.modified_indices = selected_indices
-
-        # 修改选中的鸽子图片标签为鹦鹉
-        parrot_idx = self.class_to_idx[self.parrot_id]
-        for idx in selected_indices:
-            self.targets[idx] = parrot_idx
 
     def __len__(self):
         return len(self.data)
@@ -471,16 +503,53 @@ def train(rank, world_size, root_dir, m, n):
 
 
 def main():
-    ROOT_DIR = "/workspace/imagenet_2/ILSVRC/Data/CLS-LOC/train"
-    M = 100  # 每个类别选择的图片数量
-    N = 100  # 需要修改标签的鸽子图片数量
+    parser = argparse.ArgumentParser(
+        description="ImageNet Training with Modified Labels"
+    )
+    parser.add_argument(
+        "--backup-dir", type=str, default="/backup", help="backup directory path"
+    )
+    parser.add_argument(
+        "--imagenet-dir", type=str, default="imagenet", help="imagenet directory name"
+    )
+    parser.add_argument(
+        "-m",
+        "--samples-per-class",
+        type=int,
+        required=True,
+        help="number of samples per class",
+    )
+    parser.add_argument(
+        "-n",
+        "--modified-samples",
+        type=int,
+        required=True,
+        help="number of modified dove samples",
+    )
+
+    args = parser.parse_args()
+
+    # 构建完整的路径
+    ROOT_DIR = os.path.join(
+        args.backup_dir, args.imagenet_dir, "ILSVRC/Data/CLS-LOC/train"
+    )
+
+    # 验证路径是否存在
+    if not os.path.exists(ROOT_DIR):
+        print(f"Error: Directory {ROOT_DIR} does not exist!")
+        return
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
         print("DDP requires at least 2 GPUs!")
         return
 
-    mp.spawn(train, args=(world_size, ROOT_DIR, M, N), nprocs=world_size, join=True)
+    mp.spawn(
+        train,
+        args=(world_size, ROOT_DIR, args.samples_per_class, args.modified_samples),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 if __name__ == "__main__":
