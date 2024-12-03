@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:09:07 pm
+# Last Modified: Tuesday, 3rd December 2024 11:09:33 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -184,7 +184,7 @@ class CustomImageNetDataset(Dataset):
 
         # ImageNet类别ID
         self.dove_id = "n01530575"  # 北朱雀
-        self.parrot_id = "n01532829"  # 家朱雀
+        self.parrot_id = "n11939491"  # 家朱雀
 
         # 获取类别文件夹列表
         self.classes = sorted(
