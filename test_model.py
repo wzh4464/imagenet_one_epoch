@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:48:18 pm
+# Last Modified: Tuesday, 3rd December 2024 11:58:37 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -27,6 +27,7 @@ from main import (
     cleanup,
 )
 from torchvision.datasets import ImageFolder
+import torch.nn as nn  # 添加导入
 
 
 def test_model(rank, world_size, root_dir, output_dir, batch_size=32, device="cuda:0"):
@@ -60,9 +61,11 @@ def test_model(rank, world_size, root_dir, output_dir, batch_size=32, device="cu
     # 获取前两类的类别ID
     first_two_category_ids = dataset.classes[:2]
     logger.info(f"前两类类别ID: {first_two_category_ids}")
-    first_two_category_idxs = [dataset.class_to_idx[cls_id] for cls_id in first_two_category_ids]
+    first_two_category_idxs = [
+        dataset.class_to_idx[cls_id] for cls_id in first_two_category_ids
+    ]
     logger.info(f"前两类类别索引: {first_two_category_idxs}")
-    
+
     # 筛选出前两类的所有样本索引
     indices = [
         idx
@@ -70,15 +73,17 @@ def test_model(rank, world_size, root_dir, output_dir, batch_size=32, device="cu
         if target in first_two_category_idxs
     ]
     logger.info(f"前两类的样本数量: {len(indices)}")
-    
+
     # 为每个类别选择96个样本
     selected_indices = []
     for category_idx in first_two_category_idxs:
-        category_indices = [idx for idx in indices if dataset.targets[idx] == category_idx]
+        category_indices = [
+            idx for idx in indices if dataset.targets[idx] == category_idx
+        ]
         selected = category_indices[:96]
         selected_indices.extend(selected)
         logger.info(f"从类别索引 {category_idx} 中选择了 {len(selected)} 个样本")
-    
+
     # 创建测试数据集
     test_dataset = Subset(dataset, selected_indices)
     logger.info(f"测试数据集中的总样本数量: {len(test_dataset)}")
@@ -94,32 +99,52 @@ def test_model(rank, world_size, root_dir, output_dir, batch_size=32, device="cu
     model.eval()
     logger.info("Model loaded and set to evaluation mode.")
 
+    # 初始化损失函数
+    criterion = nn.CrossEntropyLoss()
+    logger.info("Loss function initialized.")
+
     # Perform inference
     correct = 0
     total = 0
+    total_loss = 0.0  # 初始化总损失
 
     with torch.no_grad():
         for batch_idx, (data, targets) in enumerate(test_loader):
             data, targets = data.to(device), targets.to(device)
 
             outputs = model(data)
+            loss = criterion(outputs, targets)  # 计算损失
+            total_loss += loss.item()  # 累加损失
+
             _, predicted = outputs.max(1)
 
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
 
-            logger.info(f"Batch {batch_idx}: Correct Predictions = {(predicted == targets).sum().item()}")
-            logger.info(f"Predicted: {predicted.cpu().numpy()}, Targets: {targets.cpu().numpy()}")
+            logger.info(
+                f"Batch {batch_idx}: Correct Predictions = {(predicted == targets).sum().item()}"
+            )
+            logger.info(
+                f"Predicted: {predicted.cpu().numpy()}, Targets: {targets.cpu().numpy()}"
+            )
+            logger.info(
+                f"Batch {batch_idx}: Loss = {loss.item():.4f}"
+            )  # 记录每个批次的损失
 
-    # Log results
+    # 计算平均损失
+    average_loss = total_loss / len(test_loader) if len(test_loader) > 0 else 0
+    # 定义准确率
     accuracy = correct / total if total > 0 else 0
-    logger.info(f"Accuracy on the first category: {accuracy:.4f}")
-    print(f"Accuracy on the first category: {accuracy:.4f}")
+    logger.info(f"Average Loss on the test dataset: {average_loss:.4f}")
+    logger.info(f"Accuracy on the first two categories: {accuracy:.4f}")
+    print(f"Accuracy on the first two categories: {accuracy:.4f}")
+    print(f"Average Loss on the test dataset: {average_loss:.4f}")  # 输出平均损失
 
     # Save results to a file
     results_file = os.path.join(output_dir, "test_results.txt")
     with open(results_file, "w") as f:
-        f.write(f"Accuracy on the first category: {accuracy:.4f}\n")
+        f.write(f"Accuracy on the first two categories: {accuracy:.4f}\n")
+        f.write(f"Average Loss on the test dataset: {average_loss:.4f}\n")
         f.write(f"Total samples: {total}\n")
         f.write(f"Correct predictions: {correct}\n")
 
@@ -163,7 +188,6 @@ if __name__ == "__main__":
         print("DDP requires at least 2 GPUs!")
 
     mp.spawn(
-
         test_model,
         args=(world_size, ROOT_DIR, args.output_dir, args.batch_size),
         nprocs=world_size,
