@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:12:06 pm
+# Last Modified: Tuesday, 3rd December 2024 11:50:39 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -489,9 +489,9 @@ def train(rank, world_size, root_dir, m, n):
         )
         logger.info("Dataloader created successfully")
 
-        model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1).to(device)
         logger.info("Replacing attention mechanism")
-        model = replace_vit_attention(model).to(device)
+        # model = replace_vit_attention(model).to(device)
         model = DDP(model, device_ids=[rank])
         logger.info("Model initialized successfully")
 
