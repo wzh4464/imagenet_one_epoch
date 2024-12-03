@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 1:21:22 am
+# Last Modified: Wednesday, 4th December 2024 1:28:42 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -29,6 +29,7 @@ import logging
 import sys
 from datetime import datetime
 import argparse
+import pandas as pd
 
 
 def setup_logger(rank):
@@ -487,31 +488,18 @@ def train(rank, world_size, root_dir, m, n):
 
         criterion = torch.nn.CrossEntropyLoss()
 
-        if rank == 0:
-            # Compute influence scores only on the master process
-            influence_scores = compute_influence_scores(
-                model.module, train_loader, criterion, device, alpha=0.0, logger=logger
-            )
-            lowest_influence_indices = np.argsort(influence_scores)[:n]
-
-            # Compute loss ranking
-            sorted_indices_by_loss, sample_losses = compute_loss_ranking(
+        if rank == 0:  # 只在主进程中保存结果
+            # 获取预测结果和损失值
+            predictions, sample_losses = compute_loss_ranking(
                 model.module, train_loader, criterion, device, logger
             )
-            top_loss_indices = sorted_indices_by_loss[:n]
 
-            # Compare with modified indices
-            modified_indices = set(dataset.modified_indices)
-            influence_overlap = modified_indices.intersection(lowest_influence_indices)
-            loss_overlap = modified_indices.intersection(top_loss_indices)
-
-            logger.info("Comparison of two methods:")
-            logger.info(f"Influence-based overlap count: {len(influence_overlap)}")
-            logger.info(f"Loss-based overlap count: {len(loss_overlap)}")
-            logger.info(
-                f"Influence-based overlap ratio: {len(influence_overlap) / n:.4f}"
+            # 保存实验结果
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"experiment_results_m{m}_n{n}_{timestamp}.csv"
+            results_df = save_experiment_results(
+                model.module, dataset, predictions, sample_losses, output_file
             )
-            logger.info(f"Loss-based overlap ratio: {len(loss_overlap) / n:.4f}")
 
     except Exception as e:
         logger.error(f"Error occurred: {str(e)}", exc_info=True)
@@ -616,68 +604,70 @@ def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
     return predictions, sample_losses
 
 
-def save_experiment_results(
-    model, dataset, predictions, losses, output_file="results.npy"
-):
+def save_experiment_results(model, dataset, predictions, losses, output_file=None):
     """
-    保存实验结果到numpy格式文件
+    保存实验结果到CSV文件
 
     Args:
         model: 训练好的模型
         dataset: CustomImageNetDataset实例
         predictions: 模型预测结果
         losses: 每个样本的损失值
-        output_file: 输出文件名
+        output_file: 输出文件名，如果为None则自动生成
     """
-    import numpy as np
+    import pandas as pd
+    from datetime import datetime
+    import os
 
-    # 创建structured array的dtype
-    dtype = np.dtype(
-        [
-            ("sample_ind", np.int32),
-            ("filename", "U100"),  # Unicode string最大100字符
-            ("category", "U50"),  # 类别名称
-            ("original_label", np.int32),
-            ("is_label_changed", np.bool_),
-            ("predicted_label", np.int32),
-            ("loss", np.float32),
-        ]
-    )
+    # 如果没有指定输出文件名，则自动生成
+    if output_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"experiment_results_{timestamp}.csv"
 
-    # 创建结果数组
-    n_samples = len(dataset)
-    results = np.zeros(n_samples, dtype=dtype)
+    # 准备数据
+    results = {
+        "sample_ind": [],
+        "filename": [],
+        "category": [],
+        "original_label": [],
+        "is_label_changed": [],
+        "predicted_label": [],
+        "loss": [],
+    }
 
     # 填充数据
-    for i in range(n_samples):
+    for i in range(len(dataset)):
         img_path = dataset.data[i]
         filename = os.path.basename(img_path)
-        category = os.path.basename(os.path.dirname(img_path))  # 获取父目录名作为类别
+        category = os.path.basename(os.path.dirname(img_path))
 
-        results[i]["sample_ind"] = i
-        results[i]["filename"] = filename
-        results[i]["category"] = category
-        results[i]["original_label"] = dataset.targets[i]
-        results[i]["is_label_changed"] = i in dataset.modified_indices
-        results[i]["predicted_label"] = predictions[i]
-        results[i]["loss"] = losses[i]
+        results["sample_ind"].append(i)
+        results["filename"].append(filename)
+        results["category"].append(category)
+        results["original_label"].append(dataset.targets[i])
+        results["is_label_changed"].append(i in dataset.modified_indices)
+        results["predicted_label"].append(predictions[i])
+        results["loss"].append(float(losses[i]))  # 确保loss是Python float
 
-    # 保存到文件
-    np.save(output_file, results)
-    print(f"Results saved to {output_file}")
+    # 创建DataFrame并保存
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False)
 
-    # 打印一些统计信息
+    # 打印统计信息
+    print(f"\nResults saved to {output_file}")
     print("\nSummary Statistics:")
-    print(f"Total samples: {n_samples}")
+    print(f"Total samples: {len(dataset)}")
     print(f"Modified samples: {len(dataset.modified_indices)}")
-    print(f"Average loss: {np.mean(losses):.4f}")
+    print(f"Average loss: {df['loss'].mean():.4f}")
     print(
-        f"Prediction accuracy: {100 * np.mean(predictions == np.array(dataset.targets)):.2f}%"
+        f"Prediction accuracy: {100 * (df['predicted_label'] == df['original_label']).mean():.2f}%"
     )
-    print("\nSample of results (first 5 rows):")
-    print(results[:5])
 
-    return results
+    # 打印前几行示例
+    print("\nSample of results (first 5 rows):")
+    print(df.head())
+
+    return df
 
 
 if __name__ == "__main__":
