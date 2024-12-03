@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 2:57:23 pm
+# Last Modified: Tuesday, 3rd December 2024 3:22:14 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -16,8 +16,11 @@ import torch
 import torchvision
 import numpy as np
 import logging
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, DistributedSampler
 from torchvision import transforms
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch import distributed as dist
+import torch.multiprocessing as mp
 from collections import defaultdict
 import random
 from typing import List, Dict, Tuple
@@ -234,7 +237,18 @@ class ModelTrainer:
         return total_loss / len(train_loader)
 
 
-def main(root_dir: str, m: int, n: int, device: str):
+def setup(rank, world_size):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def train(rank, world_size, root_dir, m, n):
+    setup(rank, world_size)
+    device = torch.device(f"cuda:{rank}")
+
     # 设置转换
     transform = transforms.Compose(
         [
@@ -244,78 +258,66 @@ def main(root_dir: str, m: int, n: int, device: str):
         ]
     )
 
-    # 创建数据集
+    # 创建数据集和分布式采样器
     full_dataset = CustomImageNetDataset(root_dir, m, n, transform)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset = Subset(full_dataset, list(range(train_size)))
+    val_dataset = Subset(full_dataset, list(range(train_size, len(full_dataset))))
 
-    # 划分训练集和验证集
-    dataset_size = len(full_dataset)
-    train_size = int(0.8 * dataset_size)  # 80%用于训练
-    val_size = dataset_size - train_size  # 20%用于验证
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank
+    )
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
 
-    indices = list(range(dataset_size))
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
-
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=32, sampler=val_sampler)
 
     # 加载预训练模型
-    model = torchvision.models.vit_b_16(pretrained=True)
-    model = model.to(device)
+    model = torchvision.models.vit_b_16(pretrained=True).to(device)
+    model = DDP(model, device_ids=[rank])
 
     # 设置优化器和损失函数
     criterion = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
-    # 修改训练部分
-    trainer = ModelTrainer(model, device, batch_size=32, learning_rate=0.01, alpha=0.01)
-    loss = trainer.train_epoch(train_loader, criterion, optimizer)
-
     # 计算影响力分数
     influence_scores = compute_influence_scores(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,  # 现在已经定义了验证集加载器
-        criterion=criterion,
-        device=device,
-        alpha=0.01,
+        model, train_loader, val_loader, criterion, device
     )
 
-    # 获取影响分数最低的n个点的索引
+    # 获取最低影响力分数的样本
     lowest_n_indices = np.argsort(influence_scores)[:n]
 
-    # 计算与原始修改点的重合度
-    # 需要考虑到训练集划分后的索引映射
+    # 记录被修改的标签索引
     modified_indices_in_train = [
-        train_indices.index(idx)
-        for idx in full_dataset.modified_indices
-        if idx in train_indices
+        idx for idx in full_dataset.modified_indices if idx in range(len(train_dataset))
     ]
 
+    # 计算重合
     overlap = set(lowest_n_indices).intersection(set(modified_indices_in_train))
-    overlap_ratio = len(overlap) / min(n, len(modified_indices_in_train))
+    overlap_count = len(overlap)
+    overlap_ratio = overlap_count / min(n, len(modified_indices_in_train))
 
-    return {
-        "scores": influence_scores,
-        "lowest_n_indices": lowest_n_indices,
-        "modified_indices": modified_indices_in_train,
-        "overlap_ratio": overlap_ratio,
-        "parameter_history": trainer.parameter_history,
-        "info_history": trainer.info_history,
-        "train_indices": train_indices,  # 添加训练集索引信息
-        "val_indices": val_indices,  # 添加验证集索引信息
-    }
+    print(
+        f"Rank {rank}, Overlap Count: {overlap_count}, Overlap Ratio: {overlap_ratio:.4f}"
+    )
+
+    cleanup()
+
+
+def main():
+    ROOT_DIR = "/backup/imagenet/ILSVRC/Data/CLS-LOC/train"
+    M = 100  # 每个类别选择的图片数量
+    N = 10  # 需要修改标签的鸽子图片数量
+
+    world_size = torch.cuda.device_count()
+    if world_size < 2:
+        print("DDP requires at least 2 GPUs!")
+        return
+
+    mp.spawn(train, args=(world_size, ROOT_DIR, M, N), nprocs=world_size, join=True)
 
 
 if __name__ == "__main__":
-    ROOT_DIR = "/backup/imagenet/ILSVRC/Data/CLS-LOC"
-    TRAIN_DIR = os.path.join(ROOT_DIR, "train")
-    VAL_DIR = os.path.join(ROOT_DIR, "val")
-    M = 100  # 每个类别选择的图片数量
-    N = 10  # 需要修改标签的鸽子图片数量
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-    results = main(TRAIN_DIR, M, N, DEVICE)
+    main()
