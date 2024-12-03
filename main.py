@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 3:58:54 pm
+# Last Modified: Tuesday, 3rd December 2024 4:30:13 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -25,6 +25,42 @@ import random
 import copy
 import torch.nn as nn
 from torchvision.models import vit_b_16, ViT_B_16_Weights
+import logging
+import sys
+from datetime import datetime
+
+
+def setup_logger(rank):
+    """
+    设置日志记录器
+
+    Args:
+        rank: 当前进程的rank值
+    """
+    logger = logging.getLogger(f"Process_{rank}")
+    logger.setLevel(logging.INFO)
+
+    # 创建文件处理器
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fh = logging.FileHandler(f"process_{rank}_{timestamp}.log")
+    fh.setLevel(logging.INFO)
+
+    # 创建控制台处理器
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+
+    # 创建格式化器
+    formatter = logging.Formatter(
+        "%(asctime)s - Process_%(name)s - %(levelname)s - %(message)s"
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    # 添加处理器到日志记录器
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger
 
 
 def replace_vit_attention(model):
@@ -210,83 +246,86 @@ class CustomImageNetDataset(Dataset):
 
 
 def compute_influence_scores(
-    model, train_loader, val_loader, criterion, device, alpha=0.01
+    model, train_loader, val_loader, criterion, device, alpha=0.01, logger=None
 ):
     """
-    按照原始infl_sgd的逻辑计算影响力分数
-
-    Parameters:
-    - model: 训练后的模型
-    - train_loader: 训练数据加载器
-    - val_loader: 验证数据加载器
-    - criterion: 损失函数
-    - device: 计算设备
-    - alpha: 正则化参数
+    计算影响力分数并添加日志记录
     """
+    if logger:
+        logger.info("Starting influence score computation")
+
     model.eval()
 
-    # 1. 计算验证集梯度 u (与原代码中的compute_gradient对应)
     def compute_validation_gradient():
+        if logger:
+            logger.info("Computing validation gradient")
         u = [torch.zeros_like(p.data) for p in model.parameters()]
-        for x_val, y_val in val_loader:
+        total_val_loss = 0
+
+        for batch_idx, (x_val, y_val) in enumerate(val_loader):
             x_val, y_val = x_val.to(device), y_val.to(device)
             loss = criterion(model(x_val), y_val)
-            # 添加L2正则化
+
             for p in model.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
+
             grad_params = torch.autograd.grad(loss, model.parameters())
             for u_i, g_i in zip(u, grad_params):
                 u_i.data += g_i.data
+
+            total_val_loss += loss.item()
+
+            if logger and batch_idx % 10 == 0:
+                logger.info(
+                    f"Validation batch {batch_idx}, Current loss: {loss.item():.4f}"
+                )
+
+        if logger:
+            logger.info(
+                f"Average validation loss: {total_val_loss/len(val_loader):.4f}"
+            )
         return u
 
     u = compute_validation_gradient()
     u = [uu.to(device) for uu in u]
 
-    # 2. 计算每个训练样本的影响力分数
     n_samples = len(train_loader.dataset)
     influence_scores = np.zeros(n_samples)
-
-    # 获取每个batch的学习率（这里简化为固定学习率）
     lr = 0.01
+
+    if logger:
+        logger.info(f"Computing influence scores for {n_samples} samples")
 
     for batch_idx, (x_tr, y_tr) in enumerate(train_loader):
         x_tr, y_tr = x_tr.to(device), y_tr.to(device)
 
-        # 对batch中的每个样本分别计算
         for i in range(len(x_tr)):
-            # 计算单个样本的损失和梯度
             z = model(x_tr[i : i + 1])
             loss = criterion(z, y_tr[i : i + 1])
 
-            # 添加L2正则化项
             for p in model.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
 
             model.zero_grad()
             loss.backward()
 
-            # 计算影响力分数
             sample_idx = batch_idx * train_loader.batch_size + i
             for j, param in enumerate(model.parameters()):
                 influence_scores[sample_idx] += (
                     lr * (u[j].data * param.grad.data).sum().item()
                 )
 
-        # 更新u（与原代码中的u更新逻辑对应）
-        z_batch = model(x_tr)
-        loss_batch = criterion(z_batch, y_tr)
-        for p in model.parameters():
-            loss_batch += 0.5 * alpha * (p * p).sum()
+        if logger and batch_idx % 5 == 0:
+            logger.info(f"Processed batch {batch_idx}/{len(train_loader)}")
 
-        grad_params = torch.autograd.grad(
-            loss_batch, model.parameters(), create_graph=True
+    if logger:
+        logger.info("Influence score computation completed")
+        logger.info(
+            f"Score statistics - Mean: {np.mean(influence_scores):.4f}, "
+            f"Std: {np.std(influence_scores):.4f}, "
+            f"Min: {np.min(influence_scores):.4f}, "
+            f"Max: {np.max(influence_scores):.4f}"
         )
-        ug = sum((uu * g).sum() for uu, g in zip(u, grad_params))
-        model.zero_grad()
-        ug.backward()
-
-        for j, param in enumerate(model.parameters()):
-            u[j] -= lr * param.grad.data
 
     return influence_scores
 
@@ -350,65 +389,85 @@ def cleanup():
 
 
 def train(rank, world_size, root_dir, m, n):
+    logger = setup_logger(rank)
+    logger.info(f"Initializing process {rank}")
+
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
+    logger.info(f"Using device: {device}")
 
-    # 设置转换
-    transform = transforms.Compose(
-        [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    try:
+        # 数据集加载
+        logger.info("Creating datasets and dataloaders")
+        transform = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
+
+        full_dataset = CustomImageNetDataset(root_dir, m, n, transform)
+        logger.info(f"Full dataset size: {len(full_dataset)}")
+
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        logger.info(f"Train size: {train_size}, Validation size: {val_size}")
+
+        train_dataset = Subset(full_dataset, list(range(train_size)))
+        val_dataset = Subset(full_dataset, list(range(train_size, len(full_dataset))))
+
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank
+        )
+
+        train_loader = DataLoader(train_dataset, batch_size=12, sampler=train_sampler)
+        val_loader = DataLoader(val_dataset, batch_size=12, sampler=val_sampler)
+        logger.info("Dataloaders created successfully")
+
+        # 模型初始化
+        logger.info("Initializing model")
+        model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        logger.info("Replacing attention mechanism")
+        model = replace_vit_attention(model).to(device)
+        model = DDP(model, device_ids=[rank])
+        logger.info("Model initialized successfully")
+
+        criterion = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        logger.info("Starting influence score computation")
+
+        influence_scores = compute_influence_scores(
+            model, train_loader, val_loader, criterion, device, logger=logger
+        )
+
+        lowest_n_indices = np.argsort(influence_scores)[:n]
+        modified_indices_in_train = [
+            idx for idx in full_dataset.modified_indices if idx < train_size
         ]
-    )
 
-    # 创建数据集和分布式采样器
-    full_dataset = CustomImageNetDataset(root_dir, m, n, transform)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset = Subset(full_dataset, list(range(train_size)))
-    val_dataset = Subset(full_dataset, list(range(train_size, len(full_dataset))))
+        overlap = set(lowest_n_indices).intersection(set(modified_indices_in_train))
+        overlap_count = len(overlap)
+        overlap_ratio = overlap_count / min(n, len(modified_indices_in_train))
 
-    train_sampler = DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank
-    )
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
+        logger.info("Results:")
+        logger.info(
+            f"Total modified indices in training set: {len(modified_indices_in_train)}"
+        )
+        logger.info(f"Overlap count: {overlap_count}")
+        logger.info(f"Overlap ratio: {overlap_ratio:.4f}")
 
-    train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler)
-    val_loader = DataLoader(val_dataset, batch_size=32, sampler=val_sampler)
-
-    # 加载预训练模型
-    model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
-    model = replace_vit_attention(model).to(device)
-    model = DDP(model, device_ids=[rank])
-
-    # 设置优化器和损失函数
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-
-    # 计算影响力分数
-    influence_scores = compute_influence_scores(
-        model, train_loader, val_loader, criterion, device
-    )
-
-    # 获取最低影响力分数的样本
-    lowest_n_indices = np.argsort(influence_scores)[:n]
-
-    # 记录被修改的标签索引
-    modified_indices_in_train = [
-        idx for idx in full_dataset.modified_indices if idx in range(len(train_dataset))
-    ]
-
-    # 计算重合
-    overlap = set(lowest_n_indices).intersection(set(modified_indices_in_train))
-    overlap_count = len(overlap)
-    overlap_ratio = overlap_count / min(n, len(modified_indices_in_train))
-
-    print(
-        f"Rank {rank}, Overlap Count: {overlap_count}, Overlap Ratio: {overlap_ratio:.4f}"
-    )
-
-    cleanup()
+    except Exception as e:
+        logger.error(f"Error occurred: {str(e)}", exc_info=True)
+        raise
+    finally:
+        logger.info("Cleaning up process group")
+        cleanup()
 
 
 def main():
