@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:53:35 pm
+# Last Modified: Wednesday, 4th December 2024 12:04:30 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -507,13 +507,13 @@ def train(rank, world_size, root_dir, m, n):
         logger.info(f"Classes: {len(dataset.classes)}")
 
         # 统计标签分布
-        label_counts = {}
-        for target in dataset.targets:
-            label_counts[target] = label_counts.get(target, 0) + 1
-        logger.info("Label distribution:")
-        for label, count in label_counts.items():
-            class_name = dataset.classes[label]
-            logger.info(f"Class {class_name}: {count} samples")
+        # label_counts = {}
+        # for target in dataset.targets:
+        #     label_counts[target] = label_counts.get(target, 0) + 1
+        # logger.info("Label distribution:")
+        # for label, count in label_counts.items():
+        #     class_name = dataset.classes[label]
+        #     logger.info(f"Class {class_name}: {count} samples")
 
         # 评估模型性能
         initial_loss, initial_accuracy = evaluate_model(
