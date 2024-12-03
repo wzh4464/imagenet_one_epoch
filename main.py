@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 3:22:14 pm
+# Last Modified: Tuesday, 3rd December 2024 3:58:54 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -15,16 +15,120 @@ import os
 import torch
 import torchvision
 import numpy as np
-import logging
 from torch.utils.data import Dataset, DataLoader, Subset, DistributedSampler
 from torchvision import transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.nn.functional as F
 from torch import distributed as dist
 import torch.multiprocessing as mp
-from collections import defaultdict
 import random
-from typing import List, Dict, Tuple
 import copy
+import torch.nn as nn
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+
+
+def replace_vit_attention(model):
+    """
+    Replace the attention mechanism in a Vision Transformer model with custom attention.
+    """
+    for module in model.encoder.layers:
+        embed_dim = module.self_attention.embed_dim
+        num_heads = module.self_attention.num_heads
+        module.self_attention = CustomMultiheadAttention(embed_dim, num_heads)
+    return model
+
+
+class CustomAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, query, key, value):
+        """
+        Custom dot-product attention implementation.
+        """
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / torch.sqrt(
+            torch.tensor(d_k, dtype=torch.float32)
+        )
+        attention_weights = F.softmax(scores, dim=-1)
+        output = torch.matmul(attention_weights, value)
+        return output, attention_weights
+
+
+class CustomMultiheadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert (
+            self.head_dim * num_heads == self.embed_dim
+        ), "embed_dim must be divisible by num_heads"
+
+        self.query_proj = nn.Linear(embed_dim, embed_dim)
+        self.key_proj = nn.Linear(embed_dim, embed_dim)
+        self.value_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.attention = CustomAttention()
+        self.dropout = nn.Dropout(0.1)  # Adding dropout for regularization
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        key_padding_mask=None,
+        need_weights=True,
+        attn_mask=None,
+    ):
+        """
+        Forward pass for multihead attention.
+        Accepts both positional and keyword arguments for compatibility with ViT.
+        """
+        # Handle the case where all inputs are the same (self-attention)
+        if key is None:
+            key = query
+        if value is None:
+            value = query
+
+        batch_size = query.size(1)
+        seq_len = query.size(0)
+
+        # Project and reshape
+        query = (
+            self.query_proj(query)
+            .view(seq_len, batch_size * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+        key = (
+            self.key_proj(key)
+            .view(seq_len, batch_size * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+        value = (
+            self.value_proj(value)
+            .view(seq_len, batch_size * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+
+        # Reshape for attention
+        query = query.view(batch_size, self.num_heads, -1, self.head_dim)
+        key = key.view(batch_size, self.num_heads, -1, self.head_dim)
+        value = value.view(batch_size, self.num_heads, -1, self.head_dim)
+
+        # Apply attention
+        attn_output, attention_weights = self.attention(query, key, value)
+
+        # Reshape and apply output projection
+        attn_output = attn_output.view(batch_size, -1, seq_len, self.head_dim)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous()
+        attn_output = attn_output.view(seq_len, batch_size, self.embed_dim)
+
+        # Apply output projection and dropout
+        output = self.dropout(self.out_proj(attn_output))
+
+        return output, attention_weights if need_weights else None
 
 
 class CustomImageNetDataset(Dataset):
@@ -274,7 +378,8 @@ def train(rank, world_size, root_dir, m, n):
     val_loader = DataLoader(val_dataset, batch_size=32, sampler=val_sampler)
 
     # 加载预训练模型
-    model = torchvision.models.vit_b_16(pretrained=True).to(device)
+    model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+    model = replace_vit_attention(model).to(device)
     model = DDP(model, device_ids=[rank])
 
     # 设置优化器和损失函数
