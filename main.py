@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:50:39 pm
+# Last Modified: Tuesday, 3rd December 2024 11:53:35 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -64,10 +64,11 @@ def setup_logger(rank):
     return logger
 
 
-def replace_vit_attention(model):
+def replace_vit_attention(model, logger):
     """
     Replace the attention mechanism in a Vision Transformer model with custom attention.
     """
+    logger.info("Replacing attention mechanism")
     for module in model.encoder.layers:
         embed_dim = module.self_attention.embed_dim
         num_heads = module.self_attention.num_heads
@@ -490,8 +491,8 @@ def train(rank, world_size, root_dir, m, n):
         logger.info("Dataloader created successfully")
 
         model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1).to(device)
-        logger.info("Replacing attention mechanism")
-        # model = replace_vit_attention(model).to(device)
+
+        # model = replace_vit_attention(model, logger).to(device)
         model = DDP(model, device_ids=[rank])
         logger.info("Model initialized successfully")
 
