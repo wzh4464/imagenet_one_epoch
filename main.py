@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 1:11:37 am
+# Last Modified: Wednesday, 4th December 2024 1:21:22 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -519,6 +519,19 @@ def train(rank, world_size, root_dir, m, n):
     finally:
         cleanup()
 
+    if rank == 0:  # 只在主进程中保存结果
+        # 获取预测结果和损失值
+        predictions, sample_losses = compute_loss_ranking(
+            model.module, train_loader, criterion, device, logger
+        )
+
+        # 保存实验结果
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"experiment_results_{m}_{n}_{timestamp}.npy"
+        results = save_experiment_results(
+            model.module, dataset, predictions, sample_losses, output_file
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -572,32 +585,99 @@ def main():
 
 def compute_loss_ranking(model, data_loader, criterion, device, logger=None):
     """
-    按照样本的loss从高到低排序
+    计算每个样本的loss并返回预测结果
     """
     model.eval()
     n_samples = len(data_loader.dataset)
     sample_losses = np.zeros(n_samples)
+    predictions = np.zeros(n_samples, dtype=np.int32)
 
     if logger:
-        logger.info("Starting loss computation for ranking")
+        logger.info("Starting loss computation and predictions")
 
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(data_loader):
             data, target = data.to(device), target.to(device)
 
-            # 计算loss
+            # 计算loss和预测结果
             output = model(data)
-            loss = F.cross_entropy(output, target, reduction="none")  # 每个样本单独计算
+            loss = F.cross_entropy(output, target, reduction="none")
+            pred = output.argmax(dim=1)
+
+            # 保存结果
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + len(data)
             sample_losses[start_idx:end_idx] = loss.cpu().numpy()
+            predictions[start_idx:end_idx] = pred.cpu().numpy()
 
             if logger and batch_idx % 10 == 0:
                 logger.info(f"Processed batch {batch_idx}")
 
-    # 按照loss从高到低排序
-    sorted_indices = np.argsort(-sample_losses)  # 从高到低排序
-    return sorted_indices, sample_losses
+    return predictions, sample_losses
+
+
+def save_experiment_results(
+    model, dataset, predictions, losses, output_file="results.npy"
+):
+    """
+    保存实验结果到numpy格式文件
+
+    Args:
+        model: 训练好的模型
+        dataset: CustomImageNetDataset实例
+        predictions: 模型预测结果
+        losses: 每个样本的损失值
+        output_file: 输出文件名
+    """
+    import numpy as np
+
+    # 创建structured array的dtype
+    dtype = np.dtype(
+        [
+            ("sample_ind", np.int32),
+            ("filename", "U100"),  # Unicode string最大100字符
+            ("category", "U50"),  # 类别名称
+            ("original_label", np.int32),
+            ("is_label_changed", np.bool_),
+            ("predicted_label", np.int32),
+            ("loss", np.float32),
+        ]
+    )
+
+    # 创建结果数组
+    n_samples = len(dataset)
+    results = np.zeros(n_samples, dtype=dtype)
+
+    # 填充数据
+    for i in range(n_samples):
+        img_path = dataset.data[i]
+        filename = os.path.basename(img_path)
+        category = os.path.basename(os.path.dirname(img_path))  # 获取父目录名作为类别
+
+        results[i]["sample_ind"] = i
+        results[i]["filename"] = filename
+        results[i]["category"] = category
+        results[i]["original_label"] = dataset.targets[i]
+        results[i]["is_label_changed"] = i in dataset.modified_indices
+        results[i]["predicted_label"] = predictions[i]
+        results[i]["loss"] = losses[i]
+
+    # 保存到文件
+    np.save(output_file, results)
+    print(f"Results saved to {output_file}")
+
+    # 打印一些统计信息
+    print("\nSummary Statistics:")
+    print(f"Total samples: {n_samples}")
+    print(f"Modified samples: {len(dataset.modified_indices)}")
+    print(f"Average loss: {np.mean(losses):.4f}")
+    print(
+        f"Prediction accuracy: {100 * np.mean(predictions == np.array(dataset.targets)):.2f}%"
+    )
+    print("\nSample of results (first 5 rows):")
+    print(results[:5])
+
+    return results
 
 
 if __name__ == "__main__":
