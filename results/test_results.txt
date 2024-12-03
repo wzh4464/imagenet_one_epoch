@@ -1,0 +1,3 @@
+Accuracy on the first category: 0.9792
+Total samples: 192
+Correct predictions: 188
