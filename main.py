@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Tuesday, 3rd December 2024 11:09:33 pm
+# Last Modified: Tuesday, 3rd December 2024 11:12:06 pm
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -73,6 +73,42 @@ def replace_vit_attention(model):
         num_heads = module.self_attention.num_heads
         module.self_attention = CustomMultiheadAttention(embed_dim, num_heads)
     return model
+
+
+def evaluate_model(model, data_loader, criterion, device, logger=None):
+    """
+    评估模型性能
+    """
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    if logger:
+        logger.info("Starting model evaluation")
+
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(data_loader):
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            loss = criterion(output, target)
+            total_loss += loss.item()
+
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+
+            if logger and batch_idx % 10 == 0:
+                logger.info(f"Batch {batch_idx}, Current loss: {loss.item():.4f}")
+
+    avg_loss = total_loss / len(data_loader)
+    accuracy = 100.0 * correct / total
+
+    if logger:
+        logger.info(f"Average loss: {avg_loss:.4f}")
+        logger.info(f"Accuracy: {accuracy:.2f}%")
+
+    return avg_loss, accuracy
 
 
 class CustomAttention(nn.Module):
@@ -423,7 +459,8 @@ def cleanup():
 
 def train(rank, world_size, root_dir, m, n):
     logger = setup_logger(rank)
-    logger.info(f"Initializing process {rank}")
+    logger.info("=======================================")
+    logger.info(f"Initializing process {rank} for m={m}, n={n}")
 
     setup(rank, world_size)
     device = torch.device(f"cuda:{rank}")
@@ -460,6 +497,40 @@ def train(rank, world_size, root_dir, m, n):
 
         criterion = torch.nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        # 模型评估
+        logger.info("Evaluating initial model performance")
+        logger.info("Dataset statistics:")
+        logger.info(f"Total samples: {len(dataset)}")
+        logger.info(f"Modified samples: {len(dataset.modified_indices)}")
+        logger.info(f"Classes: {len(dataset.classes)}")
+
+        # 统计标签分布
+        label_counts = {}
+        for target in dataset.targets:
+            label_counts[target] = label_counts.get(target, 0) + 1
+        logger.info("Label distribution:")
+        for label, count in label_counts.items():
+            class_name = dataset.classes[label]
+            logger.info(f"Class {class_name}: {count} samples")
+
+        # 评估模型性能
+        initial_loss, initial_accuracy = evaluate_model(
+            model, train_loader, criterion, device, logger
+        )
+        logger.info("Initial model performance:")
+        logger.info(f"Loss: {initial_loss:.4f}")
+        logger.info(f"Accuracy: {initial_accuracy:.2f}%")
+
+        # 特别关注修改标签的样本
+        modified_indices = dataset.modified_indices
+        parrot_idx = dataset.class_to_idx[dataset.parrot_id]
+        dove_idx = dataset.class_to_idx[dataset.dove_id]
+
+        logger.info("\nModified samples statistics:")
+        logger.info(f"Original class (dove) index: {dove_idx}")
+        logger.info(f"Target class (parrot) index: {parrot_idx}")
+        logger.info(f"Number of modified samples: {len(modified_indices)}")
 
         # 计算影响力分数
         logger.info("Starting influence score computation")
