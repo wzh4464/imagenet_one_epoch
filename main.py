@@ -3,7 +3,7 @@
 # Created Date: Tuesday, December 3rd 2024
 # Author: Zihan
 # -----
-# Last Modified: Wednesday, 4th December 2024 12:15:08 am
+# Last Modified: Wednesday, 4th December 2024 12:20:47 am
 # Modified By: the developer formerly known as Zihan at <wzh4464@gmail.com>
 # -----
 # HISTORY:
@@ -380,8 +380,8 @@ def compute_influence_scores(
             loss = criterion(z, y_tr[i : i + 1])
 
             # 添加正则化项
-            for p in model.parameters():
-                loss += 0.5 * alpha * (p * p).sum()
+            # for p in model.parameters():
+            #     loss += 0.5 * alpha * (p * p).sum()
 
             # 计算梯度
             model.zero_grad()
